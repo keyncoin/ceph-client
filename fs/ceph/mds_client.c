@@ -1440,6 +1440,30 @@ static int __close_session(struct ceph_mds_client *mdsc,
 	return request_close_session(mdsc, session);
 }
 
+static bool drop_negative_children(struct dentry *dentry)
+{
+	struct dentry *child;
+	bool all_negtive = true;
+
+	if (!d_is_dir(dentry))
+		goto out;
+
+	spin_lock(&dentry->d_lock);
+	list_for_each_entry(child, &dentry->d_subdirs, d_child) {
+		if (d_really_is_positive(child)) {
+			all_negtive = false;
+			break;
+		}
+	}
+	spin_unlock(&dentry->d_lock);
+
+	if (all_negtive)
+		shrink_dcache_parent(dentry);
+out:
+	dput(dentry);
+	return all_negtive;
+}
+
 /*
  * Trim old(er) caps.
  *
@@ -1495,15 +1519,20 @@ static int trim_caps_cb(struct inode *inode, struct ceph_cap *cap, void *arg)
 		__ceph_remove_cap(cap, true);
 		session->s_trim_caps--;
 	} else {
-		int refs;
+		struct dentry *dentry;
 		/* try dropping referring dentries */
 		spin_unlock(&ci->i_ceph_lock);
-		d_prune_aliases(inode);
-		refs = atomic_read(&inode->i_count);
-		if (refs == 1)
-			session->s_trim_caps--;
-		dout("trim_caps_cb %p cap %p  pruned, count now %d\n",
-		     inode, cap, refs);
+		dentry = d_find_any_alias(inode);
+		/* drop_negative_children() calls dput() */
+		if (dentry && drop_negative_children(dentry)) {
+			int refs;
+			d_prune_aliases(inode);
+			refs = atomic_read(&inode->i_count);
+			if (refs == 1)
+				session->s_trim_caps--;
+			dout("trim_caps_cb %p cap %p pruned, count now %d\n",
+			     inode, cap, refs);
+		}
 		return 0;
 	}
 
